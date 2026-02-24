@@ -1,0 +1,38 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and local runtime files
+*.log
+*.tmp
+
+# Model and training artifacts
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.trt
+
+# OpenVINO IR artifacts
+*.xml
+*.bin
+
+# Optional large data artifacts
+*.h5
+*.hdf5
+*.npz
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
