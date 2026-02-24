@@ -577,7 +577,8 @@ class ReviewGUI:
         self.root.bind("<Key-V>", lambda e: self._set_label("void"))
         self.root.bind("<Key-c>", lambda e: self._set_label("crack"))
         self.root.bind("<Key-C>", lambda e: self._set_label("crack"))
-        self.root.bind("<Key-o>", lambda e: self._set_label("other"))
+        self.root.bind("<Key-a>", lambda e: self._set_label("other"))
+        self.root.bind("<Key-A>", lambda e: self._set_label("other"))
         self.root.bind("<Control-a>", lambda e: self._set_all_other())
         self.root.bind("<Key-b>", lambda e: self._toggle_bbox_mode())
         self.root.bind("<Key-B>", lambda e: self._toggle_bbox_mode())
@@ -610,7 +611,7 @@ class ReviewGUI:
                                    width=10, command=lambda: self._set_label("crack"))
         self.btn_crack.pack(side=tk.LEFT, padx=3)
 
-        self.btn_other = tk.Button(ctrl_frame, text="other (O)", bg="#808080", fg="white",
+        self.btn_other = tk.Button(ctrl_frame, text="other (A)", bg="#808080", fg="white",
                                    width=10, command=lambda: self._set_label("other"))
         self.btn_other.pack(side=tk.LEFT, padx=3)
 
@@ -1047,7 +1048,7 @@ class ReviewGUI:
             "  ※ 既にレビュー済みの画像は連打しても未レビュー化しない\n\n"
             "V                          選択BBoxを void に\n"
             "C                          選択BBoxを crack に\n"
-            "O                          選択BBoxを other に\n"
+            "A                          選択BBoxを other に\n"
             "Ctrl+A                     全BBoxを other に (一括)\n\n"
             "B                          BBox作成モード ON/OFF\n"
             "  作成モード中: Canvasドラッグで矩形作成\n"
@@ -1056,7 +1057,7 @@ class ReviewGUI:
             "Ctrl+Y                     やり直し (Redo)\n\n"
             "H                          このヘルプを表示\n\n"
             "=== 自動動作 ===\n"
-            "画像移動時、未確定の手動BBox (V/C/Oが未設定) は自動削除されます。\n"
+            "画像移動時、未確定の手動BBox (V/C/Aが未設定) は自動削除されます。\n"
             "(Ctrl+Zで戻せます)\n\n"
             "=== 表示閾値スライダー ===\n"
             "スライダーで表示するスコア閾値を変更できます。\n"
@@ -2261,7 +2262,7 @@ def main():
         # レビューGUI起動
         annotations_path = output_dir / "annotations.json"
         print(f"\nレビューGUIを起動します...")
-        print(f"  - BBoxをクリックして選択 → V/C/O でラベル変更")
+        print(f"  - BBoxをクリックして選択 → V/C/A でラベル変更")
         print(f"  - Space/Enter で画像をレビュー済みにして次へ")
         print(f"  - Ctrl+A で全BBoxをother")
         print(f"  - B でBBox作成モード (ドラッグで矩形追加)")
@@ -2381,3 +2382,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
