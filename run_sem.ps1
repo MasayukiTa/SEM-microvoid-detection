@@ -3,6 +3,8 @@ param(
     [string[]]$ScriptArgs
 )
 
+Set-StrictMode -Version Latest
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $target = Join-Path $scriptDir 'SEM_cudaopenvinofinetuning.py'
 
@@ -11,13 +13,21 @@ if (-not (Test-Path $target)) {
     exit 1
 }
 
-if (Get-Command python -ErrorAction SilentlyContinue) {
-    & python $target @ScriptArgs
+$venvPython = Join-Path $scriptDir '.venv\Scripts\python.exe'
+if (Test-Path $venvPython) {
+    & $venvPython $target @ScriptArgs
     exit $LASTEXITCODE
 }
 
-if (Get-Command py -ErrorAction SilentlyContinue) {
-    & py -3 $target @ScriptArgs
+$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+if ($pythonCmd) {
+    & $pythonCmd.Source $target @ScriptArgs
+    exit $LASTEXITCODE
+}
+
+$pyCmd = Get-Command py -ErrorAction SilentlyContinue
+if ($pyCmd) {
+    & $pyCmd.Source -3 $target @ScriptArgs
     exit $LASTEXITCODE
 }
 

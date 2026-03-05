@@ -21,8 +21,8 @@ import random
 import threading
 import queue as _queue
 
-# 警告抑制
-warnings.filterwarnings("ignore")
+# 主要ライブラリ警告は表示して運用時の異常検知を優先
+warnings.filterwarnings("default")
 
 # --------- 設定 ---------
 # 検出用モデルはオリジナルの3クラス (bg + void + crack)
@@ -58,6 +58,101 @@ def build_detection_model():
         m.roi_heads.box_predictor.cls_score.in_features, NUM_CLASSES_DETECT
     )
     return m
+
+
+def _load_model_weights(model, model_path, context="model"):
+    """重みを厳格ロードする。互換性がない場合は例外を送出する。"""
+    state = torch.load(model_path, map_location="cpu", weights_only=True)
+
+    if isinstance(state, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            candidate = state.get(key)
+            if isinstance(candidate, dict):
+                state = candidate
+                break
+
+    if not isinstance(state, dict):
+        raise RuntimeError(f"{context}: unsupported checkpoint format in {model_path}")
+
+    # DataParallel 保存時の "module." 接頭辞を吸収
+    model_keys = model.state_dict().keys()
+    if state and all(k.startswith("module.") for k in state.keys()) \
+            and not any(k.startswith("module.") for k in model_keys):
+        state = {k[len("module."):]: v for k, v in state.items()}
+
+    try:
+        incompatible = model.load_state_dict(state, strict=False)
+    except RuntimeError as e:
+        raise RuntimeError(f"{context}: incompatible checkpoint ({e})") from e
+
+    missing = list(incompatible.missing_keys)
+    unexpected = list(incompatible.unexpected_keys)
+    if missing or unexpected:
+        details = []
+        if missing:
+            preview = ", ".join(missing[:5])
+            suffix = " ..." if len(missing) > 5 else ""
+            details.append(f"missing_keys=[{preview}{suffix}]")
+        if unexpected:
+            preview = ", ".join(unexpected[:5])
+            suffix = " ..." if len(unexpected) > 5 else ""
+            details.append(f"unexpected_keys=[{preview}{suffix}]")
+        raise RuntimeError(f"{context}: checkpoint mismatch ({'; '.join(details)})")
+
+
+def _append_detection_rows(all_data, filename, boxes, scores, labels):
+    """1画像分の推論結果を all_data に追加する。"""
+    for box, score, label in zip(boxes, scores, labels):
+        if score < RAW_SCORE_THRESH:
+            continue
+        lbl_id = int(label)
+        lbl_name = ID2LABEL_DETECT.get(lbl_id, f"class_{lbl_id}")
+        det = _make_new_detection(
+            box=[int(round(box[0])), int(round(box[1])),
+                 int(round(box[2])), int(round(box[3]))],
+            label=lbl_name,
+            score=float(score),
+            source="model",
+        )
+        # SCORE_THRESH 以上のみ初期ラベルを自動確定。低信頼は未ラベル。
+        if score >= SCORE_THRESH:
+            det["review"]["label"] = lbl_name
+        else:
+            det["review"]["label"] = "unlabeled"
+        det["review_label"] = det["review"]["label"]
+        all_data[filename]["detections"].append(det)
+
+
+def _probe_available_backends():
+    """利用可能な推論バックエンドを判定する。"""
+    available = []
+    notes = []
+
+    if torch.cuda.is_available():
+        available.append("cuda")
+    else:
+        notes.append("CUDA unavailable")
+
+    try:
+        import openvino as ov
+        _ = ov.Core()
+        available.append("openvino")
+    except Exception as e:
+        notes.append(f"OpenVINO unavailable: {e}")
+
+    if not available:
+        available.append("cpu")
+
+    return available, notes
+
+
+def _split_files_for_backends(files, backends):
+    """ファイルをバックエンド数で均等に振り分ける。"""
+    chunks = {b: [] for b in backends}
+    for idx, filename in enumerate(files):
+        backend = backends[idx % len(backends)]
+        chunks[backend].append(filename)
+    return chunks
 
 
 # ==========================================
@@ -163,24 +258,29 @@ def save_annotations(path, all_data):
 
 
 # ==========================================
-# ワーカー1: CUDA (NVIDIA GPU) プロセス
+# 推論ワーカー共通処理
 # ==========================================
-def worker_cuda_process(file_subset, folder_path, model_path, result_queue):
+def _run_torch_worker(file_subset, folder_path, model_path, result_queue,
+                      device_name="cuda", tag="CUDA"):
     try:
-        print(f"[CUDA] 起動開始 (対象: {len(file_subset)}枚)")
-        device = torch.device("cuda")
+        print(f"[{tag}] 起動開始 (対象: {len(file_subset)}枚)")
+        if device_name == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available on this machine")
+
+        device = torch.device(device_name)
         model = build_detection_model()
-        st = torch.load(model_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(st, strict=False)
+        _load_model_weights(model, model_path, context=f"{tag} inference")
         model.to(device)
         model.eval()
-        # プロセス初期化時に1回だけ設定（プロセス単位なので正常）
-        torch.backends.cudnn.benchmark = True
-        print("[CUDA] 準備完了。処理開始...")
 
+        if device_name == "cuda":
+            # プロセス初期化時に1回だけ設定（プロセス単位なので正常）
+            torch.backends.cudnn.benchmark = True
+
+        print(f"[{tag}] 準備完了。処理開始...")
         for filename in file_subset:
+            img_path = Path(folder_path) / filename
             try:
-                img_path = Path(folder_path) / filename
                 img = Image.open(img_path).convert("RGB")
                 img = ImageOps.exif_transpose(img)
                 orig_size = img.size
@@ -188,9 +288,9 @@ def worker_cuda_process(file_subset, folder_path, model_path, result_queue):
                 img_tensor = TF.to_tensor(img_resized).to(device)
                 with torch.no_grad():
                     out = model([img_tensor])[0]
-                boxes = out['boxes'].cpu().numpy()
-                scores = out['scores'].cpu().numpy()
-                labels = out['labels'].cpu().numpy()
+                boxes = out["boxes"].cpu().numpy()
+                scores = out["scores"].cpu().numpy()
+                labels = out["labels"].cpu().numpy()
                 scale_w = orig_size[0] / INPUT_SIZE[0]
                 scale_h = orig_size[1] / INPUT_SIZE[1]
                 if len(boxes) > 0:
@@ -198,19 +298,46 @@ def worker_cuda_process(file_subset, folder_path, model_path, result_queue):
                     boxes[:, [1, 3]] *= scale_h
                 result_queue.put((filename, True, boxes, scores, labels, str(img_path)))
             except Exception as e:
-                print(f"[CUDA] エラー {filename}: {e}")
-                result_queue.put((filename, False, None, None, None, None))
+                print(f"[{tag}] エラー {filename}: {e}")
+                result_queue.put((filename, False, None, None, None, str(img_path)))
     except Exception as e:
-        print(f"[CUDA] 致命的エラー: {e}")
+        print(f"[{tag}] 致命的エラー: {e}")
     finally:
         result_queue.put(None)
-        print("[CUDA] 完了")
+        print(f"[{tag}] 完了")
+
+
+# ==========================================
+# ワーカー1: CUDA (NVIDIA GPU) プロセス
+# ==========================================
+def worker_cuda_process(file_subset, folder_path, model_path, result_queue):
+    _run_torch_worker(
+        file_subset=file_subset,
+        folder_path=folder_path,
+        model_path=model_path,
+        result_queue=result_queue,
+        device_name="cuda",
+        tag="CUDA",
+    )
+
+
+def worker_cpu_process(file_subset, folder_path, model_path, result_queue):
+    _run_torch_worker(
+        file_subset=file_subset,
+        folder_path=folder_path,
+        model_path=model_path,
+        result_queue=result_queue,
+        device_name="cpu",
+        tag="CPU",
+    )
 
 
 # ==========================================
 # ワーカー2: OpenVINO (CPU) プロセス
 # ==========================================
 def worker_ov_process(file_subset, folder_path, model_path, result_queue):
+    infer_queue = None
+    compiled_model = None
     try:
         from openvino.preprocess import PrePostProcessor
         from openvino import Layout, Type
@@ -222,8 +349,7 @@ def worker_ov_process(file_subset, folder_path, model_path, result_queue):
         if not xml_path.exists():
             print("[OpenVINO] IRモデルが見つかりません。変換します...")
             pytorch_model = build_detection_model()
-            st = torch.load(model_path, map_location="cpu", weights_only=True)
-            pytorch_model.load_state_dict(st, strict=False)
+            _load_model_weights(pytorch_model, model_path, context="OpenVINO convert")
             pytorch_model.eval()
             dummy = torch.randn(1, 3, INPUT_SIZE[1], INPUT_SIZE[0])
             ov_model = ov.convert_model(pytorch_model, example_input=dummy)
@@ -232,43 +358,74 @@ def worker_ov_process(file_subset, folder_path, model_path, result_queue):
         ppp = PrePostProcessor(ov_model)
         ppp.input().tensor() \
             .set_element_type(Type.u8) \
-            .set_layout(Layout('NCHW')) \
+            .set_layout(Layout("NCHW")) \
             .set_color_format(ov.preprocess.ColorFormat.RGB)
         ppp.input().preprocess() \
             .convert_element_type(Type.f32) \
             .scale([255.0, 255.0, 255.0])
-        ppp.input().model().set_layout(Layout('NCHW'))
+        ppp.input().model().set_layout(Layout("NCHW"))
         ov_model = ppp.build()
-        compiled_model = core.compile_model(ov_model, "CPU", {"PERFORMANCE_HINT": "THROUGHPUT"})
+        compiled_model = core.compile_model(
+            ov_model,
+            "CPU",
+            {"PERFORMANCE_HINT": "THROUGHPUT"},
+        )
         infer_queue = ov.AsyncInferQueue(compiled_model)
 
         def callback(infer_request, userdata):
             filename, orig_size, img_path = userdata
-            out_tensors = [infer_request.get_tensor(o).data for o in compiled_model.outputs]
-            boxes, scores, labels = None, None, None
-            for d in out_tensors:
-                if d.ndim == 2 and d.shape[1] == 4:
-                    boxes = d
-                elif d.ndim == 1:
-                    if np.issubdtype(d.dtype, np.integer) or np.all(d == d.astype(int)):
-                        labels = d
-                    else:
-                        scores = d
-            if boxes is None: boxes = out_tensors[0]
-            if scores is None: scores = out_tensors[1]
-            if labels is None: labels = out_tensors[2]
-            scale_w = orig_size[0] / INPUT_SIZE[0]
-            scale_h = orig_size[1] / INPUT_SIZE[1]
-            if len(boxes) > 0:
-                boxes[:, [0, 2]] *= scale_w
-                boxes[:, [1, 3]] *= scale_h
-            result_queue.put((filename, True, boxes.copy(), scores.copy(), labels.copy(), img_path))
+            try:
+                out_tensors = []
+                for o in compiled_model.outputs:
+                    arr = np.asarray(infer_request.get_tensor(o).data)
+                    if arr.ndim > 1 and arr.shape[0] == 1:
+                        arr = np.squeeze(arr, axis=0)
+                    out_tensors.append(arr)
+                if len(out_tensors) < 3:
+                    raise RuntimeError(f"Unexpected output count: {len(out_tensors)}")
+
+                boxes, scores, labels = None, None, None
+                for d in out_tensors:
+                    if d.ndim == 2 and d.shape[1] == 4:
+                        boxes = d
+                    elif d.ndim == 1:
+                        if np.issubdtype(d.dtype, np.integer) or np.all(d == d.astype(int)):
+                            labels = d
+                        else:
+                            scores = d
+                if boxes is None:
+                    boxes = out_tensors[0]
+                if scores is None:
+                    scores = out_tensors[1]
+                if labels is None:
+                    labels = out_tensors[2]
+
+                boxes = np.asarray(boxes)
+                scores = np.asarray(scores).reshape(-1)
+                labels = np.asarray(labels).reshape(-1)
+                if boxes.ndim != 2 or boxes.shape[1] != 4:
+                    raise RuntimeError(f"Unexpected box tensor shape: {boxes.shape}")
+
+                n = min(len(boxes), len(scores), len(labels))
+                boxes = boxes[:n]
+                scores = scores[:n]
+                labels = labels[:n]
+
+                scale_w = orig_size[0] / INPUT_SIZE[0]
+                scale_h = orig_size[1] / INPUT_SIZE[1]
+                if len(boxes) > 0:
+                    boxes[:, [0, 2]] *= scale_w
+                    boxes[:, [1, 3]] *= scale_h
+                result_queue.put((filename, True, boxes.copy(), scores.copy(), labels.copy(), img_path))
+            except Exception as e:
+                print(f"[OpenVINO] コールバックエラー {filename}: {e}")
+                result_queue.put((filename, False, None, None, None, img_path))
 
         infer_queue.set_callback(callback)
         print("[OpenVINO] 準備完了。処理開始...")
         for filename in file_subset:
+            img_path = Path(folder_path) / filename
             try:
-                img_path = Path(folder_path) / filename
                 img = Image.open(img_path).convert("RGB")
                 img = ImageOps.exif_transpose(img)
                 orig_size = img.size
@@ -278,14 +435,44 @@ def worker_ov_process(file_subset, folder_path, model_path, result_queue):
                 infer_queue.start_async({0: input_data}, (filename, orig_size, str(img_path)))
             except Exception as e:
                 print(f"[OpenVINO] エラー {filename}: {e}")
+                result_queue.put((filename, False, None, None, None, str(img_path)))
         infer_queue.wait_all()
-        del infer_queue
-        del compiled_model
-        result_queue.put(None)
-        print("[OpenVINO] 完了")
     except Exception as e:
         print(f"[OpenVINO] 致命的エラー: {e}")
+    finally:
+        if infer_queue is not None:
+            del infer_queue
+        if compiled_model is not None:
+            del compiled_model
         result_queue.put(None)
+        print("[OpenVINO] 完了")
+
+
+def _run_worker_inline(worker_fn, file_subset, folder_path, model_path):
+    """フォールバック用: ワーカーを同一プロセスで実行し結果を回収する。"""
+    local_queue = _queue.Queue()
+    worker_fn(file_subset, folder_path, model_path, local_queue)
+    items = []
+    while True:
+        item = local_queue.get()
+        if item is None:
+            break
+        items.append(item)
+    return items
+
+
+def _consume_detection_result(item, all_data, success_files, failed_files):
+    filename, success, boxes, scores, labels, _img_path = item
+    if success:
+        if filename in success_files:
+            return True
+        _append_detection_rows(all_data, filename, boxes, scores, labels)
+        success_files.add(filename)
+        failed_files.discard(filename)
+        return True
+    if filename not in success_files:
+        failed_files.add(filename)
+    return False
 
 
 # ==========================================
@@ -293,72 +480,117 @@ def worker_ov_process(file_subset, folder_path, model_path, result_queue):
 # ==========================================
 def execute_detection(model_path, folder_path, files):
     """検出を実行し、全画像の検出結果を新形式で返す。RAW_SCORE_THRESH以上を全保持。"""
-    result_queue = multiprocessing.Queue()
-    mid_idx = len(files) // 2
-    files_cuda = files[:mid_idx]
-    files_ov = files[mid_idx:]
-
-    p_cuda = multiprocessing.Process(
-        target=worker_cuda_process,
-        args=(files_cuda, folder_path, model_path, result_queue)
-    )
-    p_ov = multiprocessing.Process(
-        target=worker_ov_process,
-        args=(files_ov, folder_path, model_path, result_queue)
-    )
-
     # 全ファイル分のエントリを事前に初期化 (0検出画像も含める)
-    all_data = {}
-    for f in files:
-        all_data[f] = {
+    all_data = {
+        f: {
             "detections": [],
             "review_state": {"reviewed": False},
         }
+        for f in files
+    }
+
+    if not files:
+        return all_data
+
+    available_backends, probe_notes = _probe_available_backends()
+    for note in probe_notes:
+        print(f">> {note}")
+
+    # 初回実行は可能なら CUDA + OpenVINO の2系統、それ以外は単系統
+    if "cuda" in available_backends and "openvino" in available_backends:
+        primary_backends = ["cuda", "openvino"]
+    else:
+        primary_backends = [available_backends[0]]
+
+    backend_to_worker = {
+        "cuda": worker_cuda_process,
+        "openvino": worker_ov_process,
+        "cpu": worker_cpu_process,
+    }
+
+    file_chunks = _split_files_for_backends(files, primary_backends)
+    print(f">> Primary backend(s): {', '.join(primary_backends)}")
+    for b in primary_backends:
+        print(f"   - {b}: {len(file_chunks[b])} files")
+
+    result_queue = multiprocessing.Queue()
+    workers = []
+    for backend in primary_backends:
+        subset = file_chunks[backend]
+        if not subset:
+            continue
+        p = multiprocessing.Process(
+            target=backend_to_worker[backend],
+            args=(subset, folder_path, model_path, result_queue),
+        )
+        workers.append((backend, p))
+        p.start()
 
     start_time = time.time()
-    p_cuda.start()
-    p_ov.start()
-
     finished_workers = 0
-    processed_count = 0
+    result_rows = 0
+    success_files = set()
+    failed_files = set()
 
-    while finished_workers < 2:
-        item = result_queue.get()
+    while finished_workers < len(workers):
+        try:
+            item = result_queue.get(timeout=1.0)
+        except _queue.Empty:
+            if not any(p.is_alive() for _, p in workers):
+                break
+            continue
+
         if item is None:
             finished_workers += 1
             continue
-        filename, success, boxes, scores, labels, img_path = item
-        if not success:
-            continue
 
-        for box, score, label in zip(boxes, scores, labels):
-            if score >= RAW_SCORE_THRESH:
-                lbl_id = int(label)
-                lbl_name = ID2LABEL_DETECT.get(lbl_id, f"class_{lbl_id}")
-                det = _make_new_detection(
-                    box=[int(round(box[0])), int(round(box[1])), int(round(box[2])), int(round(box[3]))],
-                    label=lbl_name,
-                    score=float(score),
-                    source="model",
-                )
-                # SCORE_THRESH以上のものは初期ラベルをモデル出力に、未満はunlabeled
-                if score >= SCORE_THRESH:
-                    det["review"]["label"] = lbl_name
-                else:
-                    det["review"]["label"] = "unlabeled"
-                det["review_label"] = det["review"]["label"]
-                all_data[filename]["detections"].append(det)
-        processed_count += 1
-        if processed_count % 10 == 0:
-            elapsed = time.time() - start_time
-            print(f">> 完了: {processed_count}/{len(files)} (FPS: {processed_count/elapsed:.2f})")
+        _consume_detection_result(item, all_data, success_files, failed_files)
+        result_rows += 1
+        if result_rows % 10 == 0:
+            elapsed = max(time.time() - start_time, 1e-6)
+            print(f">> 完了: {result_rows}/{len(files)} (FPS: {result_rows / elapsed:.2f})")
 
-    p_cuda.join()
-    p_ov.join()
+    for backend, p in workers:
+        p.join(timeout=10)
+        if p.is_alive():
+            print(f"[WARN] Worker {backend} is still alive. terminating...")
+            p.terminate()
+            p.join(timeout=5)
+
     result_queue.close()
     result_queue.join_thread()
+
+    pending_files = [f for f in files if f not in success_files]
+
+    # 残件は他バックエンドで順次フォールバック
+    fallback_order = [b for b in ("cuda", "openvino", "cpu")
+                      if b == "cpu" or b in available_backends]
+    for backend in fallback_order:
+        if not pending_files:
+            break
+        print(f">> Fallback on {backend}: {len(pending_files)} files")
+        fallback_items = _run_worker_inline(
+            backend_to_worker[backend],
+            pending_files,
+            folder_path,
+            model_path,
+        )
+        for item in fallback_items:
+            _consume_detection_result(item, all_data, success_files, failed_files)
+        pending_files = [f for f in pending_files if f not in success_files]
+
     total_time = time.time() - start_time
-    print(f"\n検出完了: {total_time:.2f}秒, {len(all_data)}枚処理")
+    if pending_files:
+        print(f"[WARN] 検出失敗ファイル: {len(pending_files)}枚")
+        for fn in pending_files[:10]:
+            print(f"  - {fn}")
+        if len(pending_files) > 10:
+            print(f"  ... 他 {len(pending_files) - 10} 枚")
+
+    print(
+        f"\n検出完了: {total_time:.2f}秒, "
+        f"成功 {len(success_files)}/{len(files)}枚"
+    )
     return all_data
 
 
@@ -370,11 +602,11 @@ class ReviewGUI:
 
     DISPLAY_MAX = 900  # 表示画像の最大サイズ (px)
 
-    def __init__(self, folder_path, all_data, annotations_save_path):
+    def __init__(self, folder_path, all_data, annotations_save_path, start_dirty=False):
         self.folder_path = Path(folder_path)
         self.all_data = all_data  # 新形式: {filename: {detections: [...], review_state: {...}}}
         self.annotations_save_path = Path(annotations_save_path)
-        self.unsaved_changes = False
+        self.unsaved_changes = start_dirty
 
         # Undo/Redo スタック
         self._undo_stack = []
@@ -392,6 +624,7 @@ class ReviewGUI:
         # 画像キャッシュ（同一画像の再描画を高速化）
         self._img_cache_name = None
         self._img_cache_base = None
+        self.display_scale = 1.0
 
         # 500ms連打対策用
         self._last_reviewed_time = 0.0
@@ -799,6 +1032,7 @@ class ReviewGUI:
                 and self._img_cache_base is not None):
             img_base = self._img_cache_base
             disp_w, disp_h = img_base.size
+            scale = self.display_scale
         else:
             try:
                 img = Image.open(img_path).convert("RGB")
@@ -2036,8 +2270,7 @@ def execute_finetune(base_model_path, annotations_path,
         // config.applied["batch_size"], 1)
 
     model = build_detection_model()
-    state_dict = torch.load(base_model_path, map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict, strict=False)
+    _load_model_weights(model, base_model_path, context="Fine-tune")
     model.to(device)
     model.train()
 
@@ -2205,8 +2438,14 @@ def main():
         print(f" 総枚数: {len(files)} 枚")
         print(f" RAW_SCORE_THRESH: {RAW_SCORE_THRESH} (全保持)")
         print(f" SCORE_THRESH: {SCORE_THRESH} (初期表示)")
-        print(f" Device 1: NVIDIA Quadro P620 (CUDA)")
-        print(f" Device 2: Intel Xeon CPU (OpenVINO)")
+        available_backends, probe_notes = _probe_available_backends()
+        if torch.cuda.is_available():
+            print(f" CUDA: {torch.cuda.get_device_name(0)}")
+        else:
+            print(" CUDA: unavailable")
+        print(f" OpenVINO: {'available' if 'openvino' in available_backends else 'unavailable'}")
+        for note in probe_notes:
+            print(f"  - {note}")
         print(f"------------------------------------------------")
 
         # 検出実行 (RAW_SCORE_THRESH以上を全保持)
@@ -2241,8 +2480,8 @@ def main():
                     draw.text((b[0], b[1] - 12),
                               f"{det['raw']['label']} {det['raw']['score']:.2f}", fill=color)
                 img.save(output_dir / f"output_{filename}", quality=80)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] 出力画像保存失敗 {filename}: {e}")
 
         # CSV保存
         with open(output_dir / "summary.csv", "w", newline="", encoding="utf-8") as f:
@@ -2261,6 +2500,14 @@ def main():
 
         # レビューGUI起動
         annotations_path = output_dir / "annotations.json"
+        initial_saved = False
+        try:
+            save_annotations(annotations_path, all_data)
+            initial_saved = True
+            print(f"\n初期アノテーションを保存しました: {annotations_path}")
+        except Exception as e:
+            print(f"\n[WARN] 初期アノテーション保存失敗: {e}")
+
         print(f"\nレビューGUIを起動します...")
         print(f"  - BBoxをクリックして選択 → V/C/A でラベル変更")
         print(f"  - Space/Enter で画像をレビュー済みにして次へ")
@@ -2269,7 +2516,7 @@ def main():
         print(f"  - Ctrl+Z で元に戻す")
         print(f"  - H でヘルプ表示")
 
-        ReviewGUI(folder_path, all_data, annotations_path)
+        ReviewGUI(folder_path, all_data, annotations_path, start_dirty=not initial_saved)
 
     # ==========================================
     # モード2: レビュー再開
